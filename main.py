@@ -1,4 +1,3 @@
-import os
 from src.delivery.telegram_ui import TelegramBotUI
 from src.rag.vector_store import VectorStore
 from src.config import TELEGRAM_BOT_TOKEN
@@ -10,7 +9,7 @@ def initialize_system():
     
     # 【启动自检 1】: 强制初始化或验证本地教材向量库
     print("\n[系统自检] 连接本地 RAG 教材向量簇...")
-    vs = VectorStore()
+    VectorStore()
     print("[系统自检] 知识底座状态：就绪。\n")
 
 def main():

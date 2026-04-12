@@ -70,7 +70,7 @@ class LocalEmbeddingFunction:
         print(f"[Embedding] 正在加载本地模型: {model_name}")
         from sentence_transformers import SentenceTransformer
         self.model = SentenceTransformer(model_name, model_kwargs={"low_cpu_mem_usage": True})
-        print(f"[Embedding] 本地模型加载完毕 ✓")
+        print("[Embedding] 本地模型加载完毕 ✓")
 
     def __call__(self, texts: list[str]) -> list[list[float]]:
         if self._is_e5:

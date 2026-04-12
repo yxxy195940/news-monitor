@@ -20,7 +20,6 @@ def main():
     print()
 
     # ---- 检测旧模型的集合冲突，提示清理 ----
-    old_collection = os.path.join(CHROMA_DB_DIR, "financial_books")
     if os.path.exists(CHROMA_DB_DIR):
         # 判断是否存在旧版 bge-small 的集合（通过集合名称识别）
         import chromadb

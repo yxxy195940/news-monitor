@@ -1,6 +1,5 @@
 import os
 import sys
-import re
 import time
 import hashlib
 from datetime import datetime
@@ -13,7 +12,6 @@ from src.ingestion.news_api import NewsFetcher
 from src.analyzer.llm_engine import LLMEngine
 from src.rag.rag_engine import RAGEngine
 from src.rag.document_loader import DocumentLoader
-from src.rag.vector_store import VectorStore
 from src.models import ProcessedNews
 
 class TelegramBotUI:
@@ -67,7 +65,6 @@ class TelegramBotUI:
         await update.message.reply_text("🔕 已为您 **关闭** 快讯高频推送。您依然可以随时发送 `/flash` 主动查阅。")
 
     async def manual_books(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user_id = update.effective_user.id
         
         sources = self.rag_engine.vector_store.get_unique_sources()
         if not sources:
@@ -130,7 +127,8 @@ class TelegramBotUI:
     async def _render_news_list(self, update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int, page: int, message_to_edit=None):
         """长篇新闻头条核心列表渲染与分页按键调度"""
         cache = self.user_search_cache.get(user_id)
-        if not cache: return
+        if not cache:
+            return
             
         news_list = cache["news"]
         total = len(news_list)
@@ -205,11 +203,10 @@ class TelegramBotUI:
             
         text_lines = [f"⚡ **全球最新大盘快讯直连** (第 {page} 页)\n"]
         
-        import datetime
         for i, article in enumerate(results):
             global_idx = (page - 1) * 10 + i + 1
             ts = article.get("timestamp", 0)
-            time_str = datetime.datetime.fromtimestamp(ts).strftime("%H:%M:%S") if ts else ""
+            time_str = datetime.fromtimestamp(ts).strftime("%H:%M:%S") if ts else ""
             
             content_preview = article['content'].replace('\n', '')[:65] + "..." if len(article['content']) > 65 else article['content']
             
@@ -254,7 +251,8 @@ class TelegramBotUI:
             await context.bot.send_message(chat_id=user_id, text=message_text, reply_markup=reply_markup, parse_mode='Markdown')
 
     async def background_poll_flash(self, context: ContextTypes.DEFAULT_TYPE):
-        if not self.subscribers: return
+        if not self.subscribers:
+            return
         # 华尔街见闻 30 秒高帧率队列
         fresh_flashes = self.news_fetcher.fetch_flash_lives()
         for flash in fresh_flashes:
@@ -265,9 +263,8 @@ class TelegramBotUI:
                     await self._dispatch_flash_ui(context, chat_id, flash)
 
     async def _dispatch_flash_ui(self, context: ContextTypes.DEFAULT_TYPE, chat_id: int, flash: dict):
-        import datetime
         ts = flash.get("timestamp", 0)
-        time_str = datetime.datetime.fromtimestamp(ts).strftime("%H:%M:%S") if ts else datetime.datetime.now().strftime("%H:%M:%S")
+        time_str = datetime.fromtimestamp(ts).strftime("%H:%M:%S") if ts else datetime.now().strftime("%H:%M:%S")
         
         msg = (
             f"⚡ <b>最新快讯</b> — <i>{time_str}</i>\n\n"
@@ -281,10 +278,12 @@ class TelegramBotUI:
         await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode='HTML', reply_markup=reply_markup)
 
     async def background_poll_news(self, context: ContextTypes.DEFAULT_TYPE):
-        if not self.subscribers: return
+        if not self.subscribers:
+            return
         print("[哨兵进程] 后台半小时长篇拉取判定，更新大盘...")
         fresh_top_news = self.news_fetcher.fetch_background_news() # 收到刚刚诞生的全新 10 条
-        if not fresh_top_news: return
+        if not fresh_top_news:
+            return
         
         text_lines = [f"📰 **半小时侦测：海外宏观最新合辑 ({len(fresh_top_news)}条)**\n"]
         keyboard = []
@@ -574,7 +573,6 @@ class TelegramBotUI:
 
 
     async def _error_handler(self, update: object, context: ContextTypes.DEFAULT_TYPE):
-        import logging
         error_msg = str(context.error)
         if "NetworkError" in error_msg or "ReadError" in error_msg or "ConnectError" in error_msg:
             print(f"🌍 [Telegram 防线] 代理波动拦截: {error_msg}")
@@ -583,7 +581,6 @@ class TelegramBotUI:
 
     def run(self):
         if not TELEGRAM_BOT_TOKEN or "修改为你" in TELEGRAM_BOT_TOKEN:
-            import os
             print("[错误] 未配置有效的 TELEGRAM_BOT_TOKEN！服务离线。(TOKEN:", TELEGRAM_BOT_TOKEN, ")")
             return
             
