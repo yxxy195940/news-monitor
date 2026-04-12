@@ -19,13 +19,22 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MOCK_BOOKS_DIR = os.path.join(BASE_DIR, "mock_books")
 CHROMA_DB_DIR = os.path.join(BASE_DIR, "chroma_db")
 
-# 嵌入模型选型（修改后必须删除 chroma_db 并重新 python build_index.py）
-# 选项：
-#   intfloat/multilingual-e5-base   — 推荐，2C2G 服务器最优，占用 ~800MB，100+语言
-#   intfloat/multilingual-e5-large  — 更高精度，需 ~1.5GB
-#   BAAI/bge-m3                     — 旗舰级，需 ~2.3GB，适合高配内存工作机
-#   BAAI/bge-small-zh-v1.5          — 旧版(断弃)，仅支持中文单语言
-EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "intfloat/multilingual-e5-base")
+# ===== 嵌入模型配置 =====
+# 模式选择：
+#   api   — 使用云端 Embedding API（推荐！2G 服务器零内存压力，支持最强跨语言模型）
+#   local — 使用本地 sentence-transformers（需要 4GB+ 内存的高配机器）
+EMBEDDING_MODE = os.getenv("EMBEDDING_MODE", "api")
+
+# --- API 模式配置 ---
+# 推荐使用硅基流动 (SiliconFlow) 免费额度，注册即送 2000万 Token：https://siliconflow.cn
+# 也可以用阿里云 DashScope、火山引擎等任何 OpenAI 兼容的 Embedding API
+EMBEDDING_API_BASE = os.getenv("EMBEDDING_API_BASE", "https://api.siliconflow.cn/v1")
+EMBEDDING_API_KEY = os.getenv("EMBEDDING_API_KEY", "")
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "BAAI/bge-m3")
+
+# --- 本地模式配置（仅 EMBEDDING_MODE=local 时生效）---
+# 可选值：intfloat/multilingual-e5-small / BAAI/bge-small-zh-v1.5
+# LOCAL_EMBEDDING_MODEL = os.getenv("LOCAL_EMBEDDING_MODEL", "intfloat/multilingual-e5-small")
 
 # RAG 文本切片配置——基于语义边界感知优化
 CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "800"))     # 从 500 提升至 800，提供更广上下文

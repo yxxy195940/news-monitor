@@ -1,13 +1,16 @@
-google-generativeai>=0.4.0
+# ===== 核心依赖（服务器必装）=====
 chromadb>=0.4.22
 python-telegram-bot[job-queue]>=21.0.0
 pydantic>=2.0.0
 python-dotenv>=1.0.0
 requests>=2.31.0
-SQLAlchemy>=2.0.0
 openai>=1.0.0
 PyMuPDF>=1.23.0
 EbookLib>=0.18
 beautifulsoup4>=4.12.0
-sentence-transformers>=2.2.0
 langchain-text-splitters>=0.0.1
+
+# ===== 可选依赖（仅本地开发 / 高配服务器需要）=====
+# sentence-transformers>=2.2.0    # EMBEDDING_MODE=local 时才需要
+# google-generativeai>=0.4.0      # LLM_PROVIDER=gemini 时才需要
+# SQLAlchemy>=2.0.0               # 未来数据库功能预留

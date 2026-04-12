@@ -7,71 +7,109 @@ except ImportError:
     print("尚未安装 chromadb。请运行 pip install -r requirements.txt")
     sys.exit(1)
 
-# 确保脚本可以在任何位置运行
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-from src.config import CHROMA_DB_DIR, EMBEDDING_MODEL
-from src.rag.document_loader import DocumentLoader
+from src.config import (
+    CHROMA_DB_DIR, EMBEDDING_MODE, EMBEDDING_MODEL,
+    EMBEDDING_API_KEY, EMBEDDING_API_BASE
+)
 
 
-class MultilingualEmbeddingFunction:
+# ============================================================
+# 方案 A：云端 API Embedding（零内存占用，支持 bge-m3 旗舰跨语言）
+# ============================================================
+class APIEmbeddingFunction:
     """
-    自定义 Embedding 函数，为 multilingual-e5 系列模型自动添加 query/passage 前缀。
+    调用 OpenAI 兼容的 Embedding API（如硅基流动、阿里云 DashScope、火山引擎）。
+    完全不依赖 PyTorch，内存占用约 30MB，2G 小鸡轻松运行。
+    """
+    def __init__(self, model_name: str, api_key: str, base_url: str):
+        from openai import OpenAI
+        self.client = OpenAI(api_key=api_key, base_url=base_url)
+        self.model = model_name
+        print(f"[Embedding] API 模式已就绪: {model_name}")
+        print(f"[Embedding] 端点: {base_url}")
+
+    def __call__(self, texts: list[str]) -> list[list[float]]:
+        """批量文档向量化"""
+        if not texts:
+            return []
+        # API 限制单次批量不超过 64 条，做分批处理
+        batch_size = 32
+        all_embeddings = []
+        for i in range(0, len(texts), batch_size):
+            batch = texts[i:i+batch_size]
+            response = self.client.embeddings.create(
+                input=batch,
+                model=self.model
+            )
+            all_embeddings.extend([d.embedding for d in response.data])
+        return all_embeddings
+
+    def embed_query(self, query: str) -> list[float]:
+        """单条查询向量化"""
+        response = self.client.embeddings.create(
+            input=[query],
+            model=self.model
+        )
+        return response.data[0].embedding
+
+
+# ============================================================
+# 方案 B：本地模型 Embedding（需要 4GB+ 内存的高配机器）
+# ============================================================
+class LocalEmbeddingFunction:
+    """
+    本地 sentence-transformers 模型，支持 E5 前缀对齐。
+    仅在 EMBEDDING_MODE=local 时使用，需要足够内存。
     """
     def __init__(self, model_name: str):
-        # 1. 强制压制底层计算库的多线程（多核会成倍增加内存碎片，小鸡必死）
         os.environ['OMP_NUM_THREADS'] = '1'
         os.environ['MKL_NUM_THREADS'] = '1'
-        try:
-            import torch
-            torch.set_num_threads(1)
-        except:
-            pass
-
         self.model_name = model_name
         self._is_e5 = "e5" in model_name.lower()
-        print(f"[Embedding] 正在加载向量模型: {model_name} (极端省内存模式)")
-        
+        print(f"[Embedding] 正在加载本地模型: {model_name}")
         from sentence_transformers import SentenceTransformer
-        # 2. 启用 low_cpu_mem_usage 开启流式加载，避免瞬间内存波峰撑爆 2G 小鸡
-        self.model = SentenceTransformer(
-            model_name, 
-            model_kwargs={"low_cpu_mem_usage": True}
-        )
-        print(f"[Embedding] 模型加载完毕 ✓ (跨语言能力: {'E5-多语言前缀模式' if self._is_e5 else 'BGE-直接编码模式'})")
+        self.model = SentenceTransformer(model_name, model_kwargs={"low_cpu_mem_usage": True})
+        print(f"[Embedding] 本地模型加载完毕 ✓")
 
-    def __call__(self, input: list[str]) -> list[list[float]]:
-        """ChromaDB 调用此接口进行文档/查询向量化"""
+    def __call__(self, texts: list[str]) -> list[list[float]]:
         if self._is_e5:
-            # E5 系列：文档端加 "passage: " 前缀
-            # ChromaDB 无法区分 query 和 document 调用，
-            # 统一用 "passage: " 以保证文档入库的语义准确性；
-            # 查询端重写在 search() 方法里完成
-            texts = [f"passage: {t}" for t in input]
-        else:
-            texts = input
+            texts = [f"passage: {t}" for t in texts]
         embeddings = self.model.encode(texts, normalize_embeddings=True)
         return embeddings.tolist()
 
     def embed_query(self, query: str) -> list[float]:
-        """查询时单独调用，加 'query: ' 前缀以激活检索语义对齐"""
         if self._is_e5:
-            text = f"query: {query}"
-        else:
-            text = query
-        embedding = self.model.encode(text, normalize_embeddings=True)
+            query = f"query: {query}"
+        embedding = self.model.encode(query, normalize_embeddings=True)
         return embedding.tolist()
 
 
+# ============================================================
+# 统一入口：根据配置自动选择 Embedding 后端
+# ============================================================
+def create_embedding_function():
+    """根据 EMBEDDING_MODE 自动创建对应的 Embedding 函数"""
+    if EMBEDDING_MODE == "api":
+        if not EMBEDDING_API_KEY:
+            print("❌ [致命错误] EMBEDDING_MODE=api 但 EMBEDDING_API_KEY 未配置！")
+            print("   请在 .env 中设置 EMBEDDING_API_KEY")
+            print("   推荐免费注册硅基流动: https://siliconflow.cn")
+            sys.exit(1)
+        return APIEmbeddingFunction(EMBEDDING_MODEL, EMBEDDING_API_KEY, EMBEDDING_API_BASE)
+    else:
+        return LocalEmbeddingFunction(EMBEDDING_MODEL)
+
+
+# ============================================================
+# VectorStore 核心类
+# ============================================================
 class VectorStore:
     def __init__(self, collection_name: str = None):
-        """
-        初始化 ChromaDB。
-        集合名称与模型名称绑定，防止不同模型的向量混用导致检索错乱。
-        """
         if not os.path.exists(CHROMA_DB_DIR):
             os.makedirs(CHROMA_DB_DIR)
 
-        self.ef = MultilingualEmbeddingFunction(EMBEDDING_MODEL)
+        self.ef = create_embedding_function()
 
         # 用模型名称的末段作为集合后缀，确保不同模型互相隔离
         model_tag = EMBEDDING_MODEL.split("/")[-1].replace("-", "_").lower()
@@ -79,13 +117,11 @@ class VectorStore:
             collection_name = f"financial_books_{model_tag}"
 
         self.client = chromadb.PersistentClient(path=CHROMA_DB_DIR)
-
-        # 用 get_or_create + metadata 记录模型名（不在 ChromaDB 里传 ef，避免冲突检测）
         self.collection = self.client.get_or_create_collection(
             name=collection_name,
             metadata={"embedding_model": EMBEDDING_MODEL, "hnsw:space": "cosine"}
         )
-        print(f"[VectorStore] 已连接集合 '{collection_name}' (模型: {EMBEDDING_MODEL})")
+        print(f"[VectorStore] 已连接集合 '{collection_name}' (模型: {EMBEDDING_MODEL}, 模式: {EMBEDDING_MODE})")
 
     def _embed_docs(self, texts: list[str]) -> list[list[float]]:
         return self.ef(texts)
@@ -104,7 +140,7 @@ class VectorStore:
         self.collection.upsert(ids=ids, embeddings=embeddings, documents=documents, metadatas=metadatas)
 
     def search(self, query: str, n_results: int = 4) -> dict:
-        """跨语言语义搜索，查询向量使用 query: 前缀"""
+        """跨语言语义搜索"""
         q_embedding = self._embed_query(query)
         results = self.collection.query(
             query_embeddings=[q_embedding],
@@ -123,9 +159,7 @@ class VectorStore:
         return results
 
     def upsert_single_book(self, filename: str, chunks: list[str]):
-        """增量建库接口：为单本书注入向量，供 Telegram 上传时使用"""
-        docs_to_upsert = [{"source": filename, "content": c} for c in chunks]
-        # 生成稳定的 ID，防止重复上传同一本书造成重复切片
+        """增量建库接口：为单本书注入向量"""
         ids = [f"{filename}_chunk_{i}" for i in range(len(chunks))]
         embeddings = self._embed_docs(chunks)
         self.collection.upsert(
@@ -157,7 +191,6 @@ if __name__ == "__main__":
     queries = [
         "一只亏损的科技公司，市盈率应该是多少？",
         "What is the P/E ratio of a loss-making tech company?",
-        "如何在熊市中保持仓位稳定"
     ]
     for q in queries:
         print(f"\n用户提问: {q}")
