@@ -1,0 +1,16 @@
+.env
+chroma_db/
+mock_books/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+venv/
+.venv/
+*.log
+*.egg-info/
+dist/
+build/
+.DS_Store
+Thumbs.db
+push_to_github.ps1

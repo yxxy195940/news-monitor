@@ -1,0 +1,611 @@
+import os
+import sys
+import re
+import time
+import hashlib
+from datetime import datetime
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
+
+sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+from src.config import TELEGRAM_BOT_TOKEN, MOCK_BOOKS_DIR, OWNER_USER_ID
+from src.ingestion.news_api import NewsFetcher
+from src.analyzer.llm_engine import LLMEngine
+from src.rag.rag_engine import RAGEngine
+from src.rag.document_loader import DocumentLoader
+from src.rag.vector_store import VectorStore
+from src.models import ProcessedNews
+
+class TelegramBotUI:
+    def __init__(self):
+        self.news_fetcher = NewsFetcher()
+        self.llm_engine = LLMEngine()
+        self.rag_engine = RAGEngine()
+        
+        self.user_context = {}  # user_id -> ProcessedNews (用于回答新闻相关的提问)
+        self.subscribers = set()
+        self.flash_muted = set()  # user_id -> 标记已静音快讯推送的用户
+        
+        # 缓存系统: user_id -> {"query": str, "timestamp": float, "news": list}
+        self.user_search_cache = {}
+        self.PAGE_SIZE = 10  # 改为按 10 条一页下发
+        
+        # 万能快讯/新闻短效池 id -> dict（不管是快讯点播还是后台推送的新闻组合点播，统一在此做ID映射）
+        self.flash_cache = {}
+        
+        self.book_map = {} # 制止长书名爆雷： book_id -> book_name
+
+    async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+        self.subscribers.add(user_id)
+        welcome_text = (
+            "👋 欢迎！金融新闻检索引擎已激活。\n\n"
+            "📡 机器人会随时通过超大内存缓存为您极速提供商业大事件。\n\n"
+            "🔍 **强大的指令中枢：**\n"
+            "`/news` - 从 2500 条底座中取最新 10 大商业头条\n"
+            "`/flash` - 获取最新全网 10 条实时快讯，随时翻页直连网络\n"
+            "`/news 特斯拉` - 在内存级大图谱中瞬时检索包含此关键字的长篇报道\n"
+            "`/books` - 探查本地 Chroma 库挂载并存活的绝密投资宝典\n\n"
+            "📚 **知识库管理（机主专属）：**\n"
+            "直接发送 `.epub` 或 `.pdf` 文件 → 自动下载并完成增量建库\n\n"
+            "🔔 **推送设置：**\n"
+            "`/flash_off` - 关闭每30秒一次的高频快讯自动推送\n"
+            "`/flash_on` - 重新开启快讯自动推送\n"
+        )
+        await update.message.reply_text(welcome_text, parse_mode='Markdown')
+
+    async def flash_on(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+        self.subscribers.add(user_id)
+        if user_id in self.flash_muted:
+            self.flash_muted.remove(user_id)
+        await update.message.reply_text("🔔 已为您 **开启** 每 30 秒一次的华尔街全球快讯高频接收。")
+
+    async def flash_off(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+        self.flash_muted.add(user_id)
+        await update.message.reply_text("🔕 已为您 **关闭** 快讯高频推送。您依然可以随时发送 `/flash` 主动查阅。")
+
+    async def manual_books(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+        
+        sources = self.rag_engine.vector_store.get_unique_sources()
+        if not sources:
+            await update.message.reply_text("📚 当前知识库中未挂载任何书籍，请先执行 `python build_index.py`。")
+            return
+            
+        text_lines = [f"📚 **您的专属本地经典藏书阁** (共计确收 {len(sources)} 本实体读物)\n"]
+        for i, src in enumerate(sources):
+            text_lines.append(f"{i+1}. 📖 `{src}`")
+            
+        text_lines.append("\n👉 点击下方名录触发 AI 对该书进行底层灵魂提取与金句验证：")
+        
+        keyboard = []
+        for i, src in enumerate(sources):
+            # 将几十个字的恶心文件名压缩为轻量映射
+            book_id = f"b{i}"
+            self.book_map[book_id] = src
+            
+            # 按钮长度如果太长会导致 Telegram 报错，这里可缩略书名，提取前15个字
+            btn_text = src[:15] + "..." if len(src) > 15 else src
+            keyboard.append([InlineKeyboardButton(text=f"🧠 提取与评价: {btn_text}", callback_data=f"eval_book:{book_id}")])
+            
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        msg_text = "\n".join(text_lines)
+        
+        await update.message.reply_text(msg_text, reply_markup=reply_markup, parse_mode='Markdown')
+
+    async def manual_news(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+        self.subscribers.add(user_id)
+        
+        # 解析指令
+        text = update.message.text.strip()
+        parts = text.split(maxsplit=1)
+        args_str = parts[1] if len(parts) > 1 else ""
+            
+        query = args_str if args_str else None
+        cache_key = query if query else "GLOBAL_TOP"
+        
+        wait_msg = await update.message.reply_text(f"⏳ 正在千万级本地图谱中瞬时比对 [{query or '全球商业'}]...")
+        
+        # 本地纯内存过滤，速度极快（一次性最多挑出50条符合的）
+        results = self.news_fetcher.fetch_search_list(query=query, limit=50)
+        
+        if not results:
+            await wait_msg.edit_text("😢 搜索完缓存大盘，没有找到相关的长篇头条（你可以尝试缩短关键字，或者它不存在于近 2500 条新闻中）。")
+            return
+            
+        # 写入个人的阅读切片缓存内存区
+        self.user_search_cache[user_id] = {
+            "query": cache_key,
+            "timestamp": time.time(),
+            "news": results
+        }
+        
+        await wait_msg.delete()
+        # 渲染第 0 页
+        await self._render_news_list(update, context, user_id, 0)
+
+    async def _render_news_list(self, update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int, page: int, message_to_edit=None):
+        """长篇新闻头条核心列表渲染与分页按键调度"""
+        cache = self.user_search_cache.get(user_id)
+        if not cache: return
+            
+        news_list = cache["news"]
+        total = len(news_list)
+        
+        start_idx = page * self.PAGE_SIZE
+        end_idx = min(start_idx + self.PAGE_SIZE, total)
+        current_page_news = news_list[start_idx:end_idx]
+        
+        text_lines = [f"📰 **{'热门检索' if cache['query'] == 'GLOBAL_TOP' else '关键字检索: ' + cache['query']}** (本地共 {total} 篇符合)\n"]
+        
+        for i, article in enumerate(current_page_news):
+            global_idx = start_idx + i + 1
+            pub_date = article.get("publishedAt", "")[:10]
+            date_str = f" ({pub_date})" if pub_date else ""
+            text_lines.append(f"{global_idx}. {article['title']}{date_str}\n")
+            
+        text_lines.append("\n👉 _点击下方对应的新闻编号，大模型将发来带核心观点的深度精要：_")
+        message_text = "\n".join(text_lines)
+        
+        keyboard = []
+        num_row = []
+        for i in range(len(current_page_news)):
+            global_idx = start_idx + i + 1
+            btn = InlineKeyboardButton(text=f"[ {global_idx} ]", callback_data=f"read_index:{start_idx + i}")
+            num_row.append(btn)
+            if len(num_row) == 5:
+                keyboard.append(num_row)
+                num_row = []
+        if num_row:
+            keyboard.append(num_row)
+            
+        nav_row = []
+        if page > 0:
+            nav_row.append(InlineKeyboardButton(text="🔼 上一页", callback_data=f"page_list:{page - 1}"))
+        else:
+            nav_row.append(InlineKeyboardButton(text="🚫 已是首页", callback_data="alert:已经是第一页了！"))
+            
+        if end_idx < total:
+            nav_row.append(InlineKeyboardButton(text="🔽 下一页", callback_data=f"page_list:{page + 1}"))
+        else:
+            nav_row.append(InlineKeyboardButton(text="🚫 已是末页", callback_data="alert:已达到本次检索的结果末尾！"))
+            
+        if nav_row:
+            keyboard.append(nav_row)
+            
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        if message_to_edit:
+            await message_to_edit.edit_text(message_text, reply_markup=reply_markup, parse_mode='Markdown')
+        else:
+            await context.bot.send_message(chat_id=user_id, text=message_text, reply_markup=reply_markup, parse_mode='Markdown')
+
+    async def manual_flash(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = update.effective_user.id
+        self.subscribers.add(user_id)
+        
+        wait_msg = await update.message.reply_text("⏳ 正在跨网直连抓取新浪大盘第一页快讯...")
+        await self._fetch_and_render_flash_page(update, context, user_id, 1, wait_msg)
+
+    async def _fetch_and_render_flash_page(self, update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int, page: int, message_to_edit=None):
+        """直插华尔街见闻底层网络的实时翻页器，不采用缓存"""
+        results = self.news_fetcher.fetch_flash_list(page=page, limit=10)
+        
+        if not results:
+            if message_to_edit:
+                await message_to_edit.edit_text("😢 拉取快讯失败或网络超时，请检查节点。")
+            return
+            
+        # 短期续命快闪池供后续按键精读使用
+        for item in results:
+            self.flash_cache[item["id"]] = item
+            
+        text_lines = [f"⚡ **全球最新大盘快讯直连** (第 {page} 页)\n"]
+        
+        import datetime
+        for i, article in enumerate(results):
+            global_idx = (page - 1) * 10 + i + 1
+            ts = article.get("timestamp", 0)
+            time_str = datetime.datetime.fromtimestamp(ts).strftime("%H:%M:%S") if ts else ""
+            
+            content_preview = article['content'].replace('\n', '')[:65] + "..." if len(article['content']) > 65 else article['content']
+            
+            text_lines.append(f"**{global_idx}. [{time_str}]** {article['title']}")
+            text_lines.append(f"_{content_preview}_\n")
+            
+        text_lines.append("\n👉 _点击编号深潜，透视快讯潜台词：_")
+        message_text = "\n".join(text_lines)
+        
+        keyboard = []
+        num_row = []
+        for i, article in enumerate(results):
+            global_idx = (page - 1) * 10 + i + 1
+            # 回看时走的统一是 read_flash，它能从 flash_cache 根据 id 取得完整内容去问 LLM
+            btn = InlineKeyboardButton(text=f"[ {global_idx} ]", callback_data=f"read_flash:{article['id']}")
+            num_row.append(btn)
+            if len(num_row) == 5:
+                keyboard.append(num_row)
+                num_row = []
+        if num_row:
+            keyboard.append(num_row)
+            
+        nav_row = []
+        if page > 1:
+            nav_row.append(InlineKeyboardButton(text="🔼 上一页", callback_data=f"page_flash:{page - 1}"))
+        else:
+            nav_row.append(InlineKeyboardButton(text="🚫 已是最新", callback_data="alert:已经是最新发出的第一页快讯！"))
+            
+        if len(results) == 10:
+            nav_row.append(InlineKeyboardButton(text="🔽 早些时候", callback_data=f"page_flash:{page + 1}"))
+        else:
+            nav_row.append(InlineKeyboardButton(text="🚫 到底了", callback_data="alert:服务器已无更多历史快讯！"))
+            
+        if nav_row:
+            keyboard.append(nav_row)
+            
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        if message_to_edit:
+            await message_to_edit.edit_text(message_text, reply_markup=reply_markup, parse_mode='Markdown')
+        else:
+            await context.bot.send_message(chat_id=user_id, text=message_text, reply_markup=reply_markup, parse_mode='Markdown')
+
+    async def background_poll_flash(self, context: ContextTypes.DEFAULT_TYPE):
+        if not self.subscribers: return
+        # 华尔街见闻 30 秒高帧率队列
+        fresh_flashes = self.news_fetcher.fetch_flash_lives()
+        for flash in fresh_flashes:
+            self.flash_cache[flash["id"]] = flash
+            
+            for chat_id in self.subscribers:
+                if chat_id not in self.flash_muted:
+                    await self._dispatch_flash_ui(context, chat_id, flash)
+
+    async def _dispatch_flash_ui(self, context: ContextTypes.DEFAULT_TYPE, chat_id: int, flash: dict):
+        import datetime
+        ts = flash.get("timestamp", 0)
+        time_str = datetime.datetime.fromtimestamp(ts).strftime("%H:%M:%S") if ts else datetime.datetime.now().strftime("%H:%M:%S")
+        
+        msg = (
+            f"⚡ <b>最新快讯</b> — <i>{time_str}</i>\n\n"
+            f"{flash['content']}"
+        )
+        
+        keyboard = [
+            [InlineKeyboardButton(text="🧠 让 AI 深度解读潜台词", callback_data=f"read_flash:{flash['id']}")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode='HTML', reply_markup=reply_markup)
+
+    async def background_poll_news(self, context: ContextTypes.DEFAULT_TYPE):
+        if not self.subscribers: return
+        print("[哨兵进程] 后台半小时长篇拉取判定，更新大盘...")
+        fresh_top_news = self.news_fetcher.fetch_background_news() # 收到刚刚诞生的全新 10 条
+        if not fresh_top_news: return
+        
+        text_lines = [f"📰 **半小时侦测：海外宏观最新合辑 ({len(fresh_top_news)}条)**\n"]
+        keyboard = []
+        num_row = []
+        
+        for i, article in enumerate(fresh_top_news):
+            global_idx = i + 1
+            # 后台传来的新闻只有 url，我们把它 hash 为唯一伪快讯 ID 装进通用池子
+            news_id = "news_" + hashlib.md5(article.get("url", "").encode()).hexdigest()[:8]
+            self.flash_cache[news_id] = article
+            
+            pub_date = article.get("publishedAt", "")[:10]
+            date_str = f" ({pub_date})" if pub_date else ""
+            text_lines.append(f"{global_idx}. {article['title']}{date_str}\n")
+            
+            btn = InlineKeyboardButton(text=f"[ {global_idx} ]", callback_data=f"read_flash:{news_id}")
+            num_row.append(btn)
+            if len(num_row) == 5:
+                keyboard.append(num_row)
+                num_row = []
+                
+        if num_row:
+            keyboard.append(num_row)
+            
+        text_lines.append("\n👉 _按下编号，耗费 Token 让大模型一网打尽！_")
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        msg_text = "\n".join(text_lines)
+        
+        for chat_id in self.subscribers:
+            await context.bot.send_message(chat_id=chat_id, text=msg_text, parse_mode='Markdown', reply_markup=reply_markup)
+
+    async def _dispatch_news_ui(self, context: ContextTypes.DEFAULT_TYPE, chat_id: int, processed_news: ProcessedNews, raw_news: dict):
+        self.user_context[chat_id] = processed_news
+        
+        image_html = f"<a href='{raw_news.get('image', '')}'>&#8205;</a>" if raw_news.get("image") else ""
+        date_str = raw_news.get('publishedAt', '')[:10]
+        
+        msg = (
+            f"{image_html}📰 <b>{processed_news.title}</b>\n"
+            f"🕒 <i>{date_str}</i>\n\n"
+            f"📝 <b>原文速览：</b>\n<i>{raw_news.get('description', '')}</i>\n\n"
+            f"🎯 <b>核心价值解析：</b>\n{processed_news.ai_one_sentence_summary}\n\n"
+            f"📊 <b>宏观定调：</b>{processed_news.sentiment}\n\n"
+            f"🔗 <a href='{raw_news.get('url', '')}'>点击阅读原始网页全文</a>\n\n"
+            f"💡 <i>可敲键盘提问或点击底部知识点深度补充：</i>"
+        )
+        
+        # 如果爬虫失败，在消息底部显示警告
+        if processed_news.fetch_warning:
+            msg += f"\n\n⚠️ <b>提示：</b><i>{processed_news.fetch_warning}</i>"
+        
+        keyboard = []
+        if processed_news.key_financial_terms:
+            for term in processed_news.key_financial_terms:
+                btn = InlineKeyboardButton(text=f"📚 搞不懂『{term}』是什么", callback_data=f"ask:{term}")
+                keyboard.append([btn])
+        
+        # 如果爬虫失败，追加一个重试按钮（原文链接直达）
+        if processed_news.fetch_warning and raw_news.get("url"):
+            keyboard.append([InlineKeyboardButton(text="🔄 我想重试—直接打开原文", url=raw_news.get("url"))])
+                
+        reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
+        await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode='HTML', reply_markup=reply_markup)
+
+
+    async def handle_button_click(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        await query.answer()
+        chat_id = update.effective_user.id
+        callback_data = query.data
+        
+        # 1. 翻页请求
+        if callback_data.startswith("page_list:"):
+            target_page = int(callback_data.split(":")[1])
+            await self._render_news_list(update, context, chat_id, target_page, message_to_edit=query.message)
+            
+        elif callback_data.startswith("page_flash:"):
+            target_page = int(callback_data.split(":")[1])
+            await self._fetch_and_render_flash_page(update, context, chat_id, target_page, message_to_edit=query.message)
+            
+        # 2. 从列表中点播具体的新闻要求大模型解析
+        elif callback_data.startswith("read_index:"):
+            news_idx = int(callback_data.split(":")[1])
+            cache = self.user_search_cache.get(chat_id)
+            if not cache or news_idx >= len(cache["news"]):
+                await context.bot.send_message(chat_id=chat_id, text="⚠ 本地阅读切片已过期失效，请重新发送 /news 指令查阅。")
+                return
+                
+            target_news = cache["news"][news_idx]
+            await query.message.reply_text(f"🧠 正在提取原文精华，精读第 {news_idx+1} 篇: 『{target_news['title'][:15]}...』", disable_notification=True)
+            
+            processed = self.llm_engine.process_news(target_news["title"], target_news["content"], target_news.get("url"))
+            await self._dispatch_news_ui(context, chat_id, processed, target_news)
+            
+        # 3. 具体新闻底部的一键提问交互
+        elif callback_data.startswith("ask:"):
+            term = callback_data.replace("ask:", "")
+            user_question = f"请教一下老师，新闻里的提到的 {term} 是什么意思？对我有啥影响？"
+            await context.bot.send_message(chat_id=chat_id, text=f"👤 您提问了：{user_question}")
+            await self._run_rag_and_reply(context, chat_id, user_question)
+
+        # 4. 快讯 / 哨兵新闻 点播引擎
+        elif callback_data.startswith("read_flash:"):
+            flash_id = callback_data.replace("read_flash:", "")
+            flash_data = self.flash_cache.get(flash_id)
+            if not flash_data:
+                await query.answer("过期游离链接：原始数据可能已从缓冲池被清除。", show_alert=True)
+                return
+                
+            await query.message.reply_text(f"🧠 大模型已被您唤醒，正在解构它的潜台词: 『{flash_data['title'][:15]}...』...", disable_notification=True)
+            
+            processed = self.llm_engine.process_news(flash_data["title"], flash_data["content"], flash_data.get("url"))
+            
+            raw_mock = {
+                "description": flash_data.get("description", flash_data["content"]),
+                "url": flash_data.get("url", ""),
+                "image": flash_data.get("image", ""),
+                "publishedAt": flash_data.get("publishedAt", "")
+            }
+            await self._dispatch_news_ui(context, chat_id, processed, raw_mock)
+
+        # 5. 错误弹窗交互
+        elif callback_data.startswith("alert:"):
+            alert_msg = callback_data.replace("alert:", "")
+            await query.answer(alert_msg, show_alert=True)
+            
+        # 6. 藏经阁书籍原生精练
+        elif callback_data.startswith("eval_book:"):
+            book_id = callback_data.replace("eval_book:", "")
+            book_name = self.book_map.get(book_id)
+            if not book_name:
+                await query.answer("此书单已过期或被洗出内存，请重新发送 /books 唤起最新书单！", show_alert=True)
+                return
+                
+            await query.message.reply_text(f"\u2694\ufe0f 正在调用宏观交易员模块底层的 Chroma 检索库强制剥离并评价《{book_name}》的灵魂金句...", disable_notification=True)
+            
+            gen = self.rag_engine.evaluate_classic_book(book_name)
+            header = f"\ud83d\udcd5 **深度客观评析与金句溯源**：`{book_name}`\n\n"
+            await self._stream_to_message(context, chat_id, gen, header=header)
+
+    async def handle_book_upload(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """处理用户上传的 EPUB/PDF 电子书，即时增量建库"""
+        user_id = update.effective_user.id
+        
+        # 验权：只有机主才能上传书籍
+        if OWNER_USER_ID != 0 and user_id != OWNER_USER_ID:
+            await update.message.reply_text("🚫 该功能仅限机主账号操作。")
+            return
+            
+        doc = update.message.document
+        if not doc:
+            return
+            
+        filename = doc.file_name or ""
+        ext = os.path.splitext(filename)[1].lower()
+        
+        if ext not in (".epub", ".pdf"):
+            await update.message.reply_text(
+                f"⚠️ 不支持该文件格式（{ext or '无后缀'}），目前只接纳 <b>.epub</b> 和 <b>.pdf</b>。",
+                parse_mode='HTML'
+            )
+            return
+
+        # Telegram 免费档单文件最大 20MB
+        MAX_SIZE_MB = 20
+        if doc.file_size and doc.file_size > MAX_SIZE_MB * 1024 * 1024:
+            await update.message.reply_text(
+                f"⚠️ 文件过大（{doc.file_size // 1024 // 1024}MB），Telegram API 免费档单上限为 20MB。"
+            )
+            return
+
+        progress_msg = await update.message.reply_text(
+            f"📥 正在接收：<b>{filename}</b>，下载中...",
+            parse_mode='HTML'
+        )
+        
+        try:
+            # 下载文件到 mock_books 目录
+            os.makedirs(MOCK_BOOKS_DIR, exist_ok=True)
+            save_path = os.path.join(MOCK_BOOKS_DIR, filename)
+            
+            tg_file = await context.bot.get_file(doc.file_id)
+            await tg_file.download_to_drive(save_path)
+            
+            await progress_msg.edit_text(
+                f"✅ <b>{filename}</b> 下载完成！\n"
+                f"🔪 正在进行内容剥离与切片...",
+                parse_mode='HTML'
+            )
+            
+            # 增量建库：只对这一本书进行向量化
+            loader = DocumentLoader(MOCK_BOOKS_DIR)
+            
+            # 只提取这一本书的内容
+            if ext == ".pdf":
+                raw_text = loader.extract_text_from_pdf(save_path)
+            else:
+                raw_text = loader.extract_text_from_epub(save_path)
+                
+            if not raw_text or len(raw_text.strip()) < 100:
+                await progress_msg.edit_text(
+                    f"⚠️ 文件 <b>{filename}</b> 内容为空或无法解析（可能是加密或扫描版 PDF）。",
+                    parse_mode='HTML'
+                )
+                return
+                
+            chunks = loader.text_splitter.split_text(raw_text)
+            
+            await progress_msg.edit_text(
+                f"🧠 <b>{filename}</b> 切割完成，共 {len(chunks)} 个知识片段。\n"
+                f"🔥 正在焰烧 CPU 映射向量空间...（根据文件大小需要 1-3 分钒）",
+                parse_mode='HTML'
+            )
+            
+            # 注入 Chroma——使用统一的 upsert_single_book 接口，自动带 E5 passage 前缀向量
+            vs = self.rag_engine.vector_store
+            vs.upsert_single_book(filename, chunks)
+                
+            await progress_msg.edit_text(
+                f"🎉 <b>建库完成！</b>\n\n"
+                f"📖 书籍：{filename}\n"
+                f"📊 共建立 {len(chunks)} 个知识切片\n\n"
+                f"👉 发送 /books 可立即见到新书，并进行 AI 提炼验证。",
+                parse_mode='HTML'
+            )
+            print(f"[上传建库] 新书 '{filename}' 建库完成，{len(chunks)} 切片已注入。")
+
+            
+        except Exception as e:
+            await progress_msg.edit_text(
+                f"❌ 建库失败: <code>{e}</code>",
+                parse_mode='HTML'
+            )
+            print(f"[上传建库异常] {e}")
+
+    async def handle_user_question(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        chat_id = update.effective_user.id
+        user_question = update.message.text
+        await self._run_rag_and_reply(context, chat_id, user_question)
+
+    async def _stream_to_message(self, context, chat_id: int, async_gen, header: str = "") -> str:
+        """通用流式渲染助手：先发占位消息，逐块积累 token 并定期覆盖编辑。返回最终完整文本。"""
+        import asyncio
+        CHUNK_THRESHOLD = 60   # 每积累多少字就刷新一次
+        THROTTLE_SECS  = 0.8   # 至少 0.8 秒间隔（防TG限流）
+
+        placeholder = await context.bot.send_message(
+            chat_id=chat_id,
+            text=(header + "\u23f3 正在思考...") if header else "\u23f3 正在思考..."
+        )
+
+        accumulated = header
+        last_edit_len = len(accumulated)
+        last_edit_time = asyncio.get_event_loop().time()
+
+        async for token in async_gen:
+            accumulated += token
+            now = asyncio.get_event_loop().time()
+            chars_since = len(accumulated) - last_edit_len
+            if chars_since >= CHUNK_THRESHOLD and (now - last_edit_time) >= THROTTLE_SECS:
+                try:
+                    await placeholder.edit_text(accumulated + "\u258c")
+                    last_edit_len = len(accumulated)
+                    last_edit_time = now
+                except Exception:
+                    pass
+
+        try:
+            await placeholder.edit_text(accumulated)
+        except Exception:
+            pass
+
+        return accumulated
+
+    async def _run_rag_and_reply(self, context: ContextTypes.DEFAULT_TYPE, chat_id: int, question: str):
+        related_news = self.user_context.get(chat_id)
+        if not related_news:
+            await context.bot.send_message(chat_id, "\ud83e\udd14 我们目前还没有正在讨论的话题哦。请先点击一篇新闻进行深度解读。")
+            return
+
+        gen = self.rag_engine.generate_tutor_response(question, related_news)
+        await self._stream_to_message(context, chat_id, gen)
+
+
+    async def _error_handler(self, update: object, context: ContextTypes.DEFAULT_TYPE):
+        import logging
+        error_msg = str(context.error)
+        if "NetworkError" in error_msg or "ReadError" in error_msg or "ConnectError" in error_msg:
+            print(f"🌍 [Telegram 防线] 代理波动拦截: {error_msg}")
+        else:
+            print(f"⚠️ [Telegram 未知异常] {context.error}")
+
+    def run(self):
+        if not TELEGRAM_BOT_TOKEN or "修改为你" in TELEGRAM_BOT_TOKEN:
+            import os
+            print("[错误] 未配置有效的 TELEGRAM_BOT_TOKEN！服务离线。(TOKEN:", TELEGRAM_BOT_TOKEN, ")")
+            return
+            
+        # 挂载海量缓存重构环节（重要）
+        self.news_fetcher.initialize_global_news()
+            
+        print("🤖 Telegram 智能体调度中心正在启动...")
+        app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+        
+        app.add_handler(CommandHandler("start", self.start))
+        app.add_handler(CommandHandler("news", self.manual_news))
+        app.add_handler(CommandHandler("flash", self.manual_flash))
+        app.add_handler(CommandHandler("flash_on", self.flash_on))
+        app.add_handler(CommandHandler("flash_off", self.flash_off))
+        app.add_handler(CommandHandler("books", self.manual_books))
+        app.add_handler(CallbackQueryHandler(self.handle_button_click))
+        # 书籍上传：优先于文字消息处理，必须放在 TEXT handler 之前
+        app.add_handler(MessageHandler(filters.Document.ALL, self.handle_book_upload))
+        app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), self.handle_user_question))
+        
+        # 挂载全局异常拦截器
+        app.add_error_handler(self._error_handler)
+        
+        # 定时挂载区：宏观事件哨兵与高频快讯雷达
+        app.job_queue.run_repeating(self.background_poll_news, interval=1800, first=60) # 延迟60秒免得和系统初始化冲突
+        app.job_queue.run_repeating(self.background_poll_flash, interval=30, first=80)
+        
+        print("✅ 伴学智能体巨兽已苏醒！即刻前往 Telegram 对话。")
+        app.run_polling()
