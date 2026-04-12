@@ -426,7 +426,7 @@ class TelegramBotUI:
             if len(safe_name) > 50:
                 safe_name = safe_name[:50] + "..."
             gen = self.rag_engine.evaluate_classic_book(book_name)
-            header = f"\ud83d\udcd5 **深度客观评析与金句溯源**：`{safe_name}`\n\n"
+            header = f"📖 **深度客观评析与金句溯源**：`{safe_name}`\n\n"
             await self._stream_to_message(context, chat_id, gen, header=header)
 
     async def handle_book_upload(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
