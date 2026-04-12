@@ -16,15 +16,27 @@ from src.rag.document_loader import DocumentLoader
 class MultilingualEmbeddingFunction:
     """
     自定义 Embedding 函数，为 multilingual-e5 系列模型自动添加 query/passage 前缀。
-    intfloat/multilingual-e5-* 模型在有前缀时效果比无前缀高 10-15%。
-    BAAI/bge-m3 不需要前缀，直接透传。
     """
     def __init__(self, model_name: str):
+        # 1. 强制压制底层计算库的多线程（多核会成倍增加内存碎片，小鸡必死）
+        os.environ['OMP_NUM_THREADS'] = '1'
+        os.environ['MKL_NUM_THREADS'] = '1'
+        try:
+            import torch
+            torch.set_num_threads(1)
+        except:
+            pass
+
         self.model_name = model_name
         self._is_e5 = "e5" in model_name.lower()
-        print(f"[Embedding] 正在加载向量模型: {model_name}")
+        print(f"[Embedding] 正在加载向量模型: {model_name} (极端省内存模式)")
+        
         from sentence_transformers import SentenceTransformer
-        self.model = SentenceTransformer(model_name)
+        # 2. 启用 low_cpu_mem_usage 开启流式加载，避免瞬间内存波峰撑爆 2G 小鸡
+        self.model = SentenceTransformer(
+            model_name, 
+            model_kwargs={"low_cpu_mem_usage": True}
+        )
         print(f"[Embedding] 模型加载完毕 ✓ (跨语言能力: {'E5-多语言前缀模式' if self._is_e5 else 'BGE-直接编码模式'})")
 
     def __call__(self, input: list[str]) -> list[list[float]]:
