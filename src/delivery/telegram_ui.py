@@ -419,10 +419,14 @@ class TelegramBotUI:
                 await query.answer("此书单已过期或被洗出内存，请重新发送 /books 唤起最新书单！", show_alert=True)
                 return
                 
-            await query.message.reply_text(f"\u2694\ufe0f 正在调用宏观交易员模块底层的 Chroma 检索库强制剥离并评价《{book_name}》的灵魂金句...", disable_notification=True)
+            await query.message.reply_text(f"\u2694\ufe0f 正在调用宏观交易员模块底层的 Chroma 检索库强制剥离并评价《{book_name[:40]}》的灵魂金句...", disable_notification=True)
             
+            # 截断书名防止超长文件名触发 Telegram HTTP 层 UnicodeEncodeError
+            safe_name = book_name.encode('utf-8', errors='replace').decode('utf-8')
+            if len(safe_name) > 50:
+                safe_name = safe_name[:50] + "..."
             gen = self.rag_engine.evaluate_classic_book(book_name)
-            header = f"\ud83d\udcd5 **深度客观评析与金句溯源**：`{book_name}`\n\n"
+            header = f"\ud83d\udcd5 **深度客观评析与金句溯源**：`{safe_name}`\n\n"
             await self._stream_to_message(context, chat_id, gen, header=header)
 
     async def handle_book_upload(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
