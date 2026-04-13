@@ -205,12 +205,19 @@ class NewsFetcher:
         results = []
         for item in self.global_news_cache:
             if query:
-                # 不区分大小写的搜索
-                q_lower = query.lower()
+                # 支持空格分隔的多关键字搜索 (AND 逻辑)
+                keywords = query.lower().split()
                 title_lower = item.get("title", "").lower()
                 content_lower = item.get("content", "").lower()
                 
-                if q_lower not in title_lower and q_lower not in content_lower:
+                # 必须包含所有关键字
+                match_all = True
+                for kw in keywords:
+                    if kw not in title_lower and kw not in content_lower:
+                        match_all = False
+                        break
+                
+                if not match_all:
                     continue
             
             results.append(item)

@@ -42,7 +42,7 @@ class TelegramBotUI:
             "🔍 **强大的指令中枢：**\n"
             "`/news` - 从 2500 条底座中取最新 10 大商业头条\n"
             "`/flash` - 获取最新全网 10 条实时快讯，随时翻页直连网络\n"
-            "`/news 特斯拉` - 在内存级大图谱中瞬时检索包含此关键字的长篇报道\n"
+            "`/news 特斯拉 降价` - 在大图谱中检索同时包含这几个关键字的报道\n"
             "`/books` - 探查本地 Chroma 库挂载并存活的绝密投资宝典\n\n"
             "📚 **知识库管理（机主专属）：**\n"
             "直接发送 `.epub` 或 `.pdf` 文件 → 自动下载并完成增量建库\n\n"
@@ -104,7 +104,7 @@ class TelegramBotUI:
         query = args_str if args_str else None
         cache_key = query if query else "GLOBAL_TOP"
         
-        wait_msg = await update.message.reply_text(f"⏳ 正在千万级本地图谱中瞬时比对 [{query or '全球商业'}]...")
+        wait_msg = await update.message.reply_text(f"⏳ 正在千万级本地图谱中瞬时比对 [{query or '全球商业'}] (支持多关键字 AND 组合)...")
         
         # 本地纯内存过滤，速度极快（一次性最多挑出50条符合的）
         results = self.news_fetcher.fetch_search_list(query=query, limit=50)
