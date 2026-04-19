@@ -13,6 +13,9 @@ from src.analyzer.llm_engine import LLMEngine
 from src.rag.rag_engine import RAGEngine
 from src.rag.document_loader import DocumentLoader
 from src.models import ProcessedNews
+from src.watchdog.keyword_manager import KeywordManager
+from src.watchdog.news_filter import NewsFilter
+from src.watchdog.digest_builder import DigestBuilder
 
 class TelegramBotUI:
     def __init__(self):
@@ -32,6 +35,11 @@ class TelegramBotUI:
         self.flash_cache = {}
         
         self.book_map = {} # 制止长书名爆雷： book_id -> book_name
+        
+        # ===== 关键字监控引擎 =====
+        self.keyword_manager = KeywordManager(llm_engine=self.llm_engine)
+        self.news_filter = NewsFilter(self.keyword_manager, self.llm_engine)
+        self.digest_builder = DigestBuilder(self.news_filter, self.llm_engine)
 
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
@@ -46,6 +54,11 @@ class TelegramBotUI:
             "`/books` - 探查本地 Chroma 库挂载并存活的绝密投资宝典\n\n"
             "📚 **知识库管理（机主专属）：**\n"
             "直接发送 `.epub` 或 `.pdf` 文件 → 自动下载并完成增量建库\n\n"
+            "🎯 **关键字监控（自动盯盘）：**\n"
+            "`/watch 特斯拉` - 添加关键字/股票监控，AI 自动扩展关联词\n"
+            "`/unwatch 特斯拉` - 移除一组监控关键字\n"
+            "`/watchlist` - 查看当前所有监控关键字\n"
+            "`/digest` - 整理并发送所有已命中的新闻摘要\n\n"
             "🔔 **推送设置：**\n"
             "`/flash_off` - 关闭每30秒一次的高频快讯自动推送\n"
             "`/flash_on` - 重新开启快讯自动推送\n"
@@ -258,6 +271,22 @@ class TelegramBotUI:
         for flash in fresh_flashes:
             self.flash_cache[flash["id"]] = flash
             
+            # ===== 关键字监控过滤 =====
+            matched = self.news_filter.check_and_process_flash(flash)
+            if matched:
+                # 命中的快讯通知用户已捕获
+                for chat_id in self.subscribers:
+                    try:
+                        await context.bot.send_message(
+                            chat_id=chat_id,
+                            text=f"🎯 <b>关键字命中</b>：[{matched['watch_name']}] 捕获快讯\n\n"
+                                 f"⚡ {flash['content'][:100]}...\n\n"
+                                 f"<i>📥 已自动精炼保存，发送 /digest 查看整理报告</i>",
+                            parse_mode='HTML'
+                        )
+                    except Exception:
+                        pass
+            
             for chat_id in self.subscribers:
                 if chat_id not in self.flash_muted:
                     await self._dispatch_flash_ui(context, chat_id, flash)
@@ -284,6 +313,25 @@ class TelegramBotUI:
         fresh_top_news = self.news_fetcher.fetch_background_news() # 收到刚刚诞生的全新 10 条
         if not fresh_top_news:
             return
+        
+        # ===== 关键字监控过滤（在推送前先扫描所有新闻） =====
+        watch_hit_count = 0
+        for article in fresh_top_news:
+            matched = self.news_filter.check_and_process_news(article)
+            if matched:
+                watch_hit_count += 1
+        
+        if watch_hit_count > 0:
+            for chat_id in self.subscribers:
+                try:
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=f"🎯 <b>关键字监控</b>：本轮新闻扫描命中 {watch_hit_count} 条\n"
+                             f"<i>📥 已自动深度爬取并精炼保存，发送 /digest 查看整理报告</i>",
+                        parse_mode='HTML'
+                    )
+                except Exception:
+                    pass
         
         text_lines = [f"📰 **半小时侦测：海外宏观最新合辑 ({len(fresh_top_news)}条)**\n"]
         keyboard = []
@@ -571,6 +619,108 @@ class TelegramBotUI:
         gen = self.rag_engine.generate_tutor_response(question, related_news)
         await self._stream_to_message(context, chat_id, gen)
 
+    # ===== 关键字监控命令 =====
+
+    async def watch_keyword(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """处理 /watch <关键字/股票名称/代码> 命令"""
+        text = update.message.text.strip()
+        parts = text.split(maxsplit=1)
+        if len(parts) < 2 or not parts[1].strip():
+            await update.message.reply_text(
+                "⚠️ 请指定要监控的关键字或股票名称/代码。\n\n"
+                "用法示例：\n"
+                "`/watch 特斯拉`\n"
+                "`/watch AAPL`\n"
+                "`/watch 比特币`",
+                parse_mode='Markdown'
+            )
+            return
+
+        user_input = parts[1].strip()
+        wait_msg = await update.message.reply_text(f"🧠 正在使用 AI 分析并扩展 [{user_input}] 的关联关键字...")
+
+        # LLM 扩展关键字
+        keywords = self.keyword_manager.expand_keywords_via_llm(user_input)
+
+        # 保存
+        watch = self.keyword_manager.add_watch(user_input, keywords)
+
+        # 格式化回复
+        kw_list = "\n".join([f"  • `{kw}`" for kw in watch['keywords']])
+        await wait_msg.edit_text(
+            f"✅ **监控已设置**：`{watch['name']}`\n\n"
+            f"🔍 系统将使用以下关键字自动过滤新闻/快讯：\n{kw_list}\n\n"
+            f"📥 命中的内容会自动深度爬取、AI精炼后保存。\n"
+            f"📤 发送 `/digest` 随时获取整理报告。",
+            parse_mode='Markdown'
+        )
+
+    async def unwatch_keyword(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """处理 /unwatch <关键字> 命令"""
+        text = update.message.text.strip()
+        parts = text.split(maxsplit=1)
+        if len(parts) < 2 or not parts[1].strip():
+            await update.message.reply_text(
+                "⚠️ 请指定要移除的监控名称。\n"
+                "用法：`/unwatch 特斯拉`\n\n"
+                "发送 `/watchlist` 查看当前所有监控。",
+                parse_mode='Markdown'
+            )
+            return
+
+        name = parts[1].strip()
+        removed = self.keyword_manager.remove_watch(name)
+        if removed:
+            await update.message.reply_text(f"✅ 已移除监控：`{name}`", parse_mode='Markdown')
+        else:
+            await update.message.reply_text(
+                f"❌ 未找到名为 `{name}` 的监控。\n发送 `/watchlist` 查看当前所有监控。",
+                parse_mode='Markdown'
+            )
+
+    async def show_watchlist(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """处理 /watchlist 命令"""
+        watches = self.keyword_manager.get_all_watches()
+        if not watches:
+            await update.message.reply_text(
+                "📭 当前没有设置任何监控关键字。\n\n"
+                "使用 `/watch <关键字>` 开始监控，例如：\n"
+                "`/watch 特斯拉`\n"
+                "`/watch 比特币`",
+                parse_mode='Markdown'
+            )
+            return
+
+        # 同时显示当前待整理的新闻条数
+        matched_count = len(self.news_filter.get_all_matched())
+
+        text_lines = [f"🎯 **关键字监控面板** (共 {len(watches)} 组)\n"]
+        for i, watch in enumerate(watches):
+            kw_display = ", ".join([f"`{kw}`" for kw in watch['keywords']])
+            text_lines.append(f"{i+1}. **{watch['name']}**")
+            text_lines.append(f"   关键字：{kw_display}")
+            text_lines.append(f"   创建时间：{watch.get('created_at', 'N/A')}\n")
+
+        if matched_count > 0:
+            text_lines.append(f"\n📥 当前已积累 **{matched_count}** 条命中新闻，发送 `/digest` 获取整理报告。")
+        else:
+            text_lines.append("\n📭 暂无命中新闻，系统正在后台持续监控中...")
+
+        await update.message.reply_text("\n".join(text_lines), parse_mode='Markdown')
+
+    async def send_digest(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """处理 /digest 命令：整理并发送所有已匹配的新闻"""
+        chat_id = update.effective_user.id
+        wait_msg = await update.message.reply_text("📊 正在整理已捕获的新闻，请稍候...")
+
+        gen = self.digest_builder.build_and_stream()
+        await self._stream_to_message(context, chat_id, gen)
+
+        try:
+            await wait_msg.delete()
+        except Exception:
+            pass
+
 
     async def _error_handler(self, update: object, context: ContextTypes.DEFAULT_TYPE):
         error_msg = str(context.error)
@@ -596,6 +746,11 @@ class TelegramBotUI:
         app.add_handler(CommandHandler("flash_on", self.flash_on))
         app.add_handler(CommandHandler("flash_off", self.flash_off))
         app.add_handler(CommandHandler("books", self.manual_books))
+        # 关键字监控命令
+        app.add_handler(CommandHandler("watch", self.watch_keyword))
+        app.add_handler(CommandHandler("unwatch", self.unwatch_keyword))
+        app.add_handler(CommandHandler("watchlist", self.show_watchlist))
+        app.add_handler(CommandHandler("digest", self.send_digest))
         app.add_handler(CallbackQueryHandler(self.handle_button_click))
         # 书籍上传：优先于文字消息处理，必须放在 TEXT handler 之前
         app.add_handler(MessageHandler(filters.Document.ALL, self.handle_book_upload))
@@ -609,4 +764,5 @@ class TelegramBotUI:
         app.job_queue.run_repeating(self.background_poll_flash, interval=30, first=80)
         
         print("✅ 伴学智能体巨兽已苏醒！即刻前往 Telegram 对话。")
+        print(f"📡 关键字监控已挂载，当前 {len(self.keyword_manager.get_all_watches())} 组监控活跃。")
         app.run_polling()
