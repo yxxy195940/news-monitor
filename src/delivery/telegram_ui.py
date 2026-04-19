@@ -282,7 +282,8 @@ class TelegramBotUI:
                             text=f"🎯 <b>关键字命中</b>：[{matched['watch_name']}] 捕获快讯\n\n"
                                  f"⚡ {flash['content'][:100]}...\n\n"
                                  f"<i>📥 已自动精炼保存，发送 /digest 查看整理报告</i>",
-                            parse_mode='HTML'
+                            parse_mode='HTML',
+                            disable_notification=False  # 关键字命中 → 正常响铃
                         )
                     except Exception:
                         pass
@@ -304,7 +305,7 @@ class TelegramBotUI:
             [InlineKeyboardButton(text="🧠 让 AI 深度解读潜台词", callback_data=f"read_flash:{flash['id']}")]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
-        await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode='HTML', reply_markup=reply_markup)
+        await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode='HTML', reply_markup=reply_markup, disable_notification=True)  # 常规快讯 → 静默
 
     async def background_poll_news(self, context: ContextTypes.DEFAULT_TYPE):
         if not self.subscribers:
@@ -328,7 +329,8 @@ class TelegramBotUI:
                         chat_id=chat_id,
                         text=f"🎯 <b>关键字监控</b>：本轮新闻扫描命中 {watch_hit_count} 条\n"
                              f"<i>📥 已自动深度爬取并精炼保存，发送 /digest 查看整理报告</i>",
-                        parse_mode='HTML'
+                        parse_mode='HTML',
+                        disable_notification=False  # 关键字命中 → 正常响铃
                     )
                 except Exception:
                     pass
@@ -361,7 +363,7 @@ class TelegramBotUI:
         msg_text = "\n".join(text_lines)
         
         for chat_id in self.subscribers:
-            await context.bot.send_message(chat_id=chat_id, text=msg_text, parse_mode='Markdown', reply_markup=reply_markup)
+            await context.bot.send_message(chat_id=chat_id, text=msg_text, parse_mode='Markdown', reply_markup=reply_markup, disable_notification=True)  # 常规新闻 → 静默
 
     async def _dispatch_news_ui(self, context: ContextTypes.DEFAULT_TYPE, chat_id: int, processed_news: ProcessedNews, raw_news: dict):
         self.user_context[chat_id] = processed_news
