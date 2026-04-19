@@ -8,7 +8,7 @@ import re
 from datetime import datetime
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-from src.config import LLM_PROVIDER, DEEPSEEK_API_KEY, MINIMAX_API_KEY, GEMINI_API_KEY, BASE_DIR
+from src.config import BASE_DIR
 
 # 数据持久化路径
 DATA_DIR = os.path.join(BASE_DIR, "data")

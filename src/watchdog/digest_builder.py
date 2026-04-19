@@ -33,8 +33,8 @@ class DigestBuilder:
         total_count = len(matched_list)
         group_count = len(groups)
 
-        yield f"📊 **新闻整理报告**\n"
-        yield f"━━━━━━━━━━━━━━━━\n"
+        yield "📊 **新闻整理报告**\n"
+        yield "━━━━━━━━━━━━━━━━\n"
         yield f"共 {total_count} 条命中新闻，涉及 {group_count} 个监控主题\n\n"
 
         # 对每个分组进行 LLM 整理
