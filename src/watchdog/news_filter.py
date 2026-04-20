@@ -68,11 +68,20 @@ class NewsFilter:
         return self._load_matched()
 
     def clear_matched(self):
-        """清空已匹配的新闻（整理发送后调用）"""
+        """清空所有已匹配的新闻（全部整理发送后调用）"""
         self._save_matched([])
         self._processed_urls.clear()
         self._processed_titles.clear()
-        print("[新闻过滤器] 已清空匹配新闻池。")
+        print("[新闻过滤器] 已清空全部匹配新闻池。")
+
+    def clear_matched_by_watch(self, watch_name: str):
+        """清除指定关键字组的匹配记录（自动发完后单独清理该组）"""
+        matched_list = self._load_matched()
+        new_list = [item for item in matched_list if item.get("watch_name") != watch_name]
+        self._save_matched(new_list)
+        # 注意：这里我们故意不去 _processed_urls/titles 里删除
+        # 因为我们不希望刚刚发过的新闻，下一轮又被抓进来重新发
+        print(f"[新闻过滤器] 已清空关键字 [{watch_name}] 的匹配新闻池。")
 
     def _deep_crawl(self, url: str) -> str:
         """深度爬取新闻全文"""

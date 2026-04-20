@@ -292,6 +292,9 @@ class TelegramBotUI:
                 if chat_id not in self.flash_muted:
                     await self._dispatch_flash_ui(context, chat_id, flash)
 
+        # 触发容量检查
+        await self._check_and_auto_digest(context)
+
     async def _dispatch_flash_ui(self, context: ContextTypes.DEFAULT_TYPE, chat_id: int, flash: dict):
         ts = flash.get("timestamp", 0)
         time_str = datetime.fromtimestamp(ts).strftime("%H:%M:%S") if ts else datetime.now().strftime("%H:%M:%S")
@@ -364,6 +367,39 @@ class TelegramBotUI:
         
         for chat_id in self.subscribers:
             await context.bot.send_message(chat_id=chat_id, text=msg_text, parse_mode='Markdown', reply_markup=reply_markup, disable_notification=True)  # 常规新闻 → 静默
+
+        # 触发容量检查
+        await self._check_and_auto_digest(context)
+
+    async def _check_and_auto_digest(self, context: ContextTypes.DEFAULT_TYPE):
+        """检查是否有关键字组的缓存内容超过阈值，并自动整理发送"""
+        if not self.subscribers:
+            return
+            
+        digest_meta = self.digest_builder.get_digest_metadata()
+        if digest_meta.get("empty"):
+            return
+            
+        for watch_name, items in digest_meta["groups"].items():
+            # 计算该组新闻的字符总长 (标题 + 摘要)
+            total_len = sum(len(item.get("title", "")) + len(item.get("summary", "")) for item in items)
+            
+            # 以 4000 字符作为强制触发阈值（留出 header 等余量，确保总长度不超过 TG 4096 限制）
+            if total_len >= 4000:
+                print(f"[哨兵进程] 关键字 [{watch_name}] 缓存达到阈值({total_len}字)，触发自动整理。")
+                for chat_id in self.subscribers:
+                    try:
+                        header_msg = (
+                            f"🔔 **[系统防超载提醒]** 关键字【{watch_name}】累积新闻已接近单条消息上限，系统已自动为您提前整理推送：\n\n"
+                            f"🏷️ **【{watch_name}】** ({len(items)} 条)\n{'─' * 20}\n\n"
+                        )
+                        gen = self.digest_builder.stream_group(watch_name, items)
+                        await self._stream_to_message(context, chat_id, gen, header=header_msg)
+                    except Exception as e:
+                        print(f"[Telegram UI] 自动整理推送失败: {e}")
+                        
+                # 仅清理这一个超标的关键字新闻池
+                self.news_filter.clear_matched_by_watch(watch_name)
 
     async def _dispatch_news_ui(self, context: ContextTypes.DEFAULT_TYPE, chat_id: int, processed_news: ProcessedNews, raw_news: dict):
         self.user_context[chat_id] = processed_news
