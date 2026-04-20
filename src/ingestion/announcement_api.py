@@ -67,7 +67,8 @@ class AnnouncementAPI:
             json_data = r.json()
             anns = json_data.get("announcements", [])
             for a in anns:
-                if not a: continue
+                if not a:
+                    continue
                 # adjunctUrl looks like finalpage/2026-04-14/1225098089.PDF
                 pdf_url = f"http://static.cninfo.com.cn/{a['adjunctUrl']}" if a.get('adjunctUrl') else ""
                 
@@ -174,8 +175,10 @@ if __name__ == "__main__":
     api = AnnouncementAPI()
     print("上交所测试 (603986):")
     res = api.fetch_latest_announcements("603986", limit=2)
-    for r in res: print(r)
+    for r in res:
+        print(r)
     
     print("\n深交所测试 (比亚迪):")
     res = api.fetch_latest_announcements("比亚迪", limit=2)
-    for r in res: print(r)
+    for r in res:
+        print(r)

@@ -108,7 +108,6 @@ class AnnouncementFilter:
             return ""
         try:
             print(f"[公告过滤器] 正在通过 Jina 解析 PDF: {url}")
-            headers = {"Accept": "application/json"} # Using JSON might be cleaner or just get text
             # Actually Jina Reader directly returns Markdown for GET requests
             resp = requests.get(f"https://r.jina.ai/{url}", timeout=45)
             if resp.status_code == 200:
