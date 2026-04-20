@@ -711,12 +711,41 @@ class TelegramBotUI:
         await update.message.reply_text("\n".join(text_lines), parse_mode='Markdown')
 
     async def send_digest(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """处理 /digest 命令：整理并发送所有已匹配的新闻"""
+        """处理 /digest 命令：按关键字分多条发送已匹配的新闻"""
         chat_id = update.effective_user.id
-        wait_msg = await update.message.reply_text("📊 正在整理已捕获的新闻，请稍候...")
+        
+        digest_meta = self.digest_builder.get_digest_metadata()
+        if digest_meta.get("empty"):
+            await context.bot.send_message(
+                chat_id, 
+                "📭 当前没有命中关键字的新闻待整理。\n\n"
+                "💡 提示：请先使用 `/watch <关键字>` 设置监控，系统会自动在后台过滤并积累相关新闻。",
+                parse_mode='Markdown'
+            )
+            return
 
-        gen = self.digest_builder.build_and_stream()
-        await self._stream_to_message(context, chat_id, gen)
+        wait_msg = await update.message.reply_text("📊 正在分批整理已捕获的新闻，请稍候...")
+
+        # 1. 发送头部总览
+        header_text = (
+            "📊 **新闻整理报告**\n"
+            "━━━━━━━━━━━━━━━━\n"
+            f"共 {digest_meta['total_count']} 条命中新闻，涉及 {digest_meta['group_count']} 个监控主题\n"
+        )
+        await context.bot.send_message(chat_id, text=header_text, parse_mode='Markdown')
+
+        # 2. 针对每个监控关键字分别发送一条消息
+        for watch_name, items in digest_meta["groups"].items():
+            group_header = f"🏷️ **【{watch_name}】** ({len(items)} 条)\n{'─' * 20}\n\n"
+            gen = self.digest_builder.stream_group(watch_name, items)
+            # 使用流式渲染单条关键字新闻
+            await self._stream_to_message(context, chat_id, gen, header=group_header)
+
+        # 3. 发送底部总结并清理
+        footer_text = f"✅ 整理完毕，共 {digest_meta['total_count']} 条新闻已分发。新闻池已清空。"
+        await context.bot.send_message(chat_id, text=footer_text)
+        
+        self.news_filter.clear_matched()
 
         try:
             await wait_msg.delete()
