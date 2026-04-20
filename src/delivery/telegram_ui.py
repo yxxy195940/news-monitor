@@ -16,6 +16,8 @@ from src.models import ProcessedNews
 from src.watchdog.keyword_manager import KeywordManager
 from src.watchdog.news_filter import NewsFilter
 from src.watchdog.digest_builder import DigestBuilder
+from src.ingestion.announcement_api import AnnouncementAPI
+from src.watchdog.announcement_filter import AnnouncementFilter
 
 class TelegramBotUI:
     def __init__(self):
@@ -40,6 +42,10 @@ class TelegramBotUI:
         self.keyword_manager = KeywordManager(llm_engine=self.llm_engine)
         self.news_filter = NewsFilter(self.keyword_manager, self.llm_engine)
         self.digest_builder = DigestBuilder(self.news_filter, self.llm_engine)
+        
+        # ===== 公司公告监控引擎 =====
+        self.announcement_api = AnnouncementAPI()
+        self.announcement_filter = AnnouncementFilter(self.llm_engine)
 
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
@@ -58,12 +64,18 @@ class TelegramBotUI:
             "`/watch 特斯拉` - 添加关键字/股票监控，AI 自动扩展关联词\n"
             "`/unwatch 特斯拉` - 移除一组监控关键字\n"
             "`/watchlist` - 查看当前所有监控关键字\n"
-            "`/digest` - 整理并发送所有已命中的新闻摘要\n\n"
-            "🔔 **推送设置：**\n"
+            "`/digest` - 立刻按关键字生成并发送近期监控新闻整理\n\n"
+            "🏢 **公司内部事件监控（看家本领）：**\n"
+            "`/watchstock 603986` - 监控指定股票的公司公告（支持名称或代码）\n"
+            "`/unwatchstock 比亚迪` - 取消个股公告监控\n"
+            "`/stocklist` - 查看关注的股票池\n\n"
+            "💬 **随时提问：**\n"
             "`/flash_off` - 关闭每30秒一次的高频快讯自动推送\n"
             "`/flash_on` - 重新开启快讯自动推送\n"
         )
         await update.message.reply_text(welcome_text, parse_mode='Markdown')
+
+
 
     async def flash_on(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
@@ -400,6 +412,41 @@ class TelegramBotUI:
                         
                 # 仅清理这一个超标的关键字新闻池
                 self.news_filter.clear_matched_by_watch(watch_name)
+
+    async def background_poll_announcements(self, context: ContextTypes.DEFAULT_TYPE):
+        """后台轮询股票公告（每5分钟）"""
+        if not self.subscribers:
+            return
+            
+        watches = self.announcement_filter.get_all_watches()
+        if not watches:
+            return
+            
+        print("[哨兵进程] 正在轮询 A股公司公告...")
+        for code, info in watches.items():
+            name = info['name']
+            anns = self.announcement_api.fetch_latest_announcements(code, limit=3)
+            for ann in anns:
+                ann['watch_name'] = name
+                processed = self.announcement_filter.process_new_announcement(ann)
+                if processed:
+                    # 发现新公告并解析成功，直接向用户推送
+                    for chat_id in self.subscribers:
+                        try:
+                            msg = (
+                                f"🏢 **公司公告速递** | **{name}** (`{code}`)\n"
+                                f"━━━━━━━━━━━━━━━━\n"
+                                f"📑 **标题**：{processed['title']}\n"
+                                f"🕒 **时间**：{processed['time']}\n"
+                                f"📊 **AI 情感判断**：{processed['sentiment']}\n\n"
+                                f"🧠 **核心解读**：\n{processed['ai_summary']}\n\n"
+                            )
+                            if processed.get("url"):
+                                msg += f"🔗 [查看原公告PDF]({processed['url']})"
+                            
+                            await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode='Markdown')
+                        except Exception as e:
+                            print(f"[Telegram UI] 公告推送失败: {e}")
 
     async def _dispatch_news_ui(self, context: ContextTypes.DEFAULT_TYPE, chat_id: int, processed_news: ProcessedNews, raw_news: dict):
         self.user_context[chat_id] = processed_news
@@ -788,7 +835,68 @@ class TelegramBotUI:
         except Exception:
             pass
 
+    # ==========================
+    # 公司公告监控命令处理
+    # ==========================
+    async def watch_stock(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        text = update.message.text.strip()
+        parts = text.split(maxsplit=1)
+        if len(parts) < 2 or not parts[1].strip():
+            await update.message.reply_text("⚠️ 请提供股票代码或名称。\n例如：`/watchstock 603986` 或 `/watchstock 比亚迪`", parse_mode='Markdown')
+            return
+            
+        keyword = parts[1].strip()
+        wait_msg = await update.message.reply_text("🔍 正在为您识别股票并添加监控...")
+        
+        # 解析股票代码
+        import re
+        from src.ingestion.announcement_api import SinaSuggestClient
+        
+        code = keyword
+        name = keyword
+        if not re.match(r'^\d{6}$', keyword):
+            suggest = SinaSuggestClient.search(keyword)
+            if suggest:
+                code = suggest['code']
+                name = suggest['name']
+        else:
+            suggest = SinaSuggestClient.search(keyword)
+            if suggest:
+                name = suggest['name']
 
+        self.announcement_filter.add_watch(code, name)
+        await wait_msg.edit_text(f"✅ **股票公告监控已设置**\n\n🎯 目标：`{name}` (`{code}`)\n📊 系统将每 5 分钟在后台自动轮询该公司的最新重大公告。", parse_mode='Markdown')
+
+    async def unwatch_stock(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        text = update.message.text.strip()
+        parts = text.split(maxsplit=1)
+        if len(parts) < 2 or not parts[1].strip():
+            await update.message.reply_text("⚠️ 请指定要移除的股票代码或名称。\n用法：`/unwatchstock 比亚迪`", parse_mode='Markdown')
+            return
+
+        keyword = parts[1].strip()
+        removed = self.announcement_filter.remove_watch(keyword)
+        if removed:
+            await update.message.reply_text(f"✅ 已移除股票公告监控：`{keyword}`", parse_mode='Markdown')
+        else:
+            await update.message.reply_text(f"❌ 未找到监控中的股票 `{keyword}`。", parse_mode='Markdown')
+            
+    async def stocklist(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        watches = self.announcement_filter.get_all_watches()
+        if not watches:
+            await update.message.reply_text("📭 当前没有设置任何股票公告监控。\n使用 `/watchstock 比亚迪` 开始监控。", parse_mode='Markdown')
+            return
+
+        text_lines = [f"🏢 **股票公告监控面板** (共 {len(watches)} 只)\n"]
+        for i, (code, info) in enumerate(watches.items()):
+            text_lines.append(f"{i+1}. **{info['name']}** (`{code}`)")
+            text_lines.append(f"   添加时间：{info.get('added_at', 'N/A')}\n")
+            
+        await update.message.reply_text("\n".join(text_lines), parse_mode='Markdown')
+
+    # ==========================
+    # 其他处理器
+    # ==========================
     async def _error_handler(self, update: object, context: ContextTypes.DEFAULT_TYPE):
         error_msg = str(context.error)
         if "NetworkError" in error_msg or "ReadError" in error_msg or "ConnectError" in error_msg:
@@ -818,6 +926,11 @@ class TelegramBotUI:
         app.add_handler(CommandHandler("unwatch", self.unwatch_keyword))
         app.add_handler(CommandHandler("watchlist", self.show_watchlist))
         app.add_handler(CommandHandler("digest", self.send_digest))
+        # 股票公告监控命令
+        app.add_handler(CommandHandler("watchstock", self.watch_stock))
+        app.add_handler(CommandHandler("unwatchstock", self.unwatch_stock))
+        app.add_handler(CommandHandler("stocklist", self.stocklist))
+        
         app.add_handler(CallbackQueryHandler(self.handle_button_click))
         # 书籍上传：优先于文字消息处理，必须放在 TEXT handler 之前
         app.add_handler(MessageHandler(filters.Document.ALL, self.handle_book_upload))
@@ -829,7 +942,9 @@ class TelegramBotUI:
         # 定时挂载区：宏观事件哨兵与高频快讯雷达
         app.job_queue.run_repeating(self.background_poll_news, interval=1800, first=60) # 延迟60秒免得和系统初始化冲突
         app.job_queue.run_repeating(self.background_poll_flash, interval=30, first=80)
+        app.job_queue.run_repeating(self.background_poll_announcements, interval=300, first=45) # 5分钟轮询一次公告
         
         print("✅ 伴学智能体巨兽已苏醒！即刻前往 Telegram 对话。")
         print(f"📡 关键字监控已挂载，当前 {len(self.keyword_manager.get_all_watches())} 组监控活跃。")
+        print(f"🏢 股票公告监控挂载，当前 {len(self.announcement_filter.get_all_watches())} 只股票活跃。")
         app.run_polling()
