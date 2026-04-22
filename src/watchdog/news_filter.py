@@ -248,8 +248,13 @@ class NewsFilter:
 
         print(f"[新闻过滤器] ⚡ 快讯命中！关键字组[{watch_name}] 关键字[{matched_keyword}] → {title[:30]}...")
 
-        # 快讯不深度爬取，直接精炼内容
-        summary = self._llm_refine(title, content)
+        # 优化：如果快讯本身足够简短（如低于150字），则不消耗 LLM 额度，直接使用原内容
+        combined_text = f"{title}\n{content}".strip() if title else content.strip()
+        if len(combined_text) < 150:
+            summary = combined_text
+        else:
+            # 快讯不深度爬取，长文本才精炼内容
+            summary = self._llm_refine(title, content)
 
         # 获取时间
         ts = flash_item.get("timestamp", 0)
