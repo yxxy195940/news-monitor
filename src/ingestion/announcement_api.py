@@ -46,7 +46,7 @@ class AnnouncementAPI:
             print(f"[AnnouncementAPI] SZSE orgId fetch error: {e}")
         return None
 
-    def fetch_szse_announcements(self, code: str, limit: int = 5):
+    def fetch_szse_announcements(self, code: str, page: int = 1, limit: int = 10):
         """深交所（巨潮资讯）"""
         org_id = self.fetch_szse_org_id(code)
         stock_param = f"{code},{org_id}" if org_id else code
@@ -56,7 +56,7 @@ class AnnouncementAPI:
         headers["Referer"] = "http://www.cninfo.com.cn/new/index"
         data = {
             "stock": stock_param,
-            "pageNum": 1,
+            "pageNum": page,
             "pageSize": limit,
             "tabName": "fulltext",
             "column": "szse"
@@ -90,11 +90,11 @@ class AnnouncementAPI:
             print(f"[AnnouncementAPI] SZSE fetch error: {e}")
         return results
 
-    def fetch_sse_announcements(self, code: str, limit: int = 5):
+    def fetch_sse_announcements(self, code: str, page: int = 1, limit: int = 10):
         """上交所"""
         # 上交所通常查询需要指定日期范围
         end_date = datetime.now().strftime("%Y-%m-%d")
-        url = f"https://query.sse.com.cn/security/stock/queryCompanyBulletinNew.do?jsonCallBack=jsonpCallback&isPagination=true&pageHelp.pageSize={limit}&pageHelp.cacheSize=1&START_DATE=2020-01-01&END_DATE={end_date}&SECURITY_CODE={code}&TITLE=&BULLETIN_TYPE=&stockType=&pageHelp.pageNo=1&pageHelp.beginPage=1&pageHelp.endPage=1&_={int(time.time()*1000)}"
+        url = f"https://query.sse.com.cn/security/stock/queryCompanyBulletinNew.do?jsonCallBack=jsonpCallback&isPagination=true&pageHelp.pageSize={limit}&pageHelp.cacheSize=1&START_DATE=2020-01-01&END_DATE={end_date}&SECURITY_CODE={code}&TITLE=&BULLETIN_TYPE=&stockType=&pageHelp.pageNo={page}&pageHelp.beginPage={page}&pageHelp.endPage={page}&_={int(time.time()*1000)}"
         headers = self.headers.copy()
         headers["Referer"] = "https://www.sse.com.cn/"
         results = []
@@ -134,7 +134,7 @@ class AnnouncementAPI:
             print(f"[AnnouncementAPI] SSE fetch error: {e}")
         return results
 
-    def fetch_latest_announcements(self, keyword: str, limit: int = 5):
+    def fetch_latest_announcements(self, keyword: str, page: int = 1, limit: int = 10):
         """入口方法：自动识别代码/名称并抓取最新公告"""
         # 1. 解析代码
         code = keyword
@@ -166,9 +166,9 @@ class AnnouncementAPI:
         
         # 2. 根据交易所拉取数据
         if exchange == 'SSE':
-            return self.fetch_sse_announcements(code, limit)
+            return self.fetch_sse_announcements(code, page, limit)
         else:
-            return self.fetch_szse_announcements(code, limit)
+            return self.fetch_szse_announcements(code, page, limit)
 
 # 测试代码
 if __name__ == "__main__":
