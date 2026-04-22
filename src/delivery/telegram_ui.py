@@ -858,7 +858,10 @@ class TelegramBotUI:
             if message_to_edit:
                 await message_to_edit.edit_text(f"❌ 未能找到 [{keyword}] 第 {page} 页的公告，可能已达末尾或输入有误。")
             else:
-                await query.message.reply_text(f"❌ 未能找到 [{keyword}] 第 {page} 页的公告。")
+                if update.callback_query:
+                    await update.callback_query.message.reply_text(f"❌ 未能找到 [{keyword}] 第 {page} 页的公告。")
+                else:
+                    await update.message.reply_text(f"❌ 未能找到 [{keyword}] 第 {page} 页的公告。")
             return
             
         text_lines = [f"🏢 **[{keyword}] 最新公告** (第 {page} 页)\\n"]
@@ -902,7 +905,10 @@ class TelegramBotUI:
         if message_to_edit:
             await message_to_edit.edit_text("\\n".join(text_lines), reply_markup=reply_markup, parse_mode='Markdown')
         else:
-            await update.callback_query.message.edit_text("\\n".join(text_lines), reply_markup=reply_markup, parse_mode='Markdown')
+            if update.callback_query:
+                await update.callback_query.message.edit_text("\\n".join(text_lines), reply_markup=reply_markup, parse_mode='Markdown')
+            else:
+                await update.message.reply_text("\\n".join(text_lines), reply_markup=reply_markup, parse_mode='Markdown')
 
     async def _error_handler(self, update: object, context: ContextTypes.DEFAULT_TYPE):
         error_msg = str(context.error)
