@@ -560,6 +560,40 @@ class TelegramBotUI:
             header = f"📖 **深度客观评析与金句溯源**：`{safe_name}`\n\n"
             await self._stream_to_message(context, chat_id, gen, header=header)
 
+        # 7. 公告翻页
+        elif callback_data.startswith("page_ann:"):
+            _, keyword, page_str = callback_data.split(':', 2)
+            await self._fetch_and_render_ann_page(update, context, keyword, int(page_str), message_to_edit=query.message)
+            await query.answer()
+            
+        # 8. 公告阅读
+        elif callback_data.startswith("read_ann:"):
+            ann_id = callback_data.replace("read_ann:", "")
+            ann = self.announcement_cache.get(ann_id)
+            if not ann:
+                await query.answer("公告缓存已过期，请重新查询。", show_alert=True)
+                return
+                
+            await query.answer("🧠 大模型正在逐字研读公告...", show_alert=False)
+            wait_msg = await query.message.reply_text(f"⏳ 正在跨网直连底层 PDF 档案并调用 AI 分析：\n{ann['title']}")
+            
+            # 同步调用大模型
+            processed = self.announcement_decoder.decode_announcement(ann)
+            
+            msg = (
+                f"🏢 **公司公告解码** | **{ann['code']}**\n"
+                f"━━━━━━━━━━━━━━━━\n"
+                f"📑 **标题**：{processed['title']}\n"
+                f"🕒 **时间**：{processed['time']}\n"
+                f"📊 **AI 情感判断**：{processed['sentiment']}\n\n"
+                f"🧠 **核心解读**：\n{processed['ai_summary']}\n\n"
+            )
+            if processed.get("url"):
+                msg += f"🔗 [查看原公告PDF]({processed['url']})"
+            
+            await wait_msg.edit_text(msg, parse_mode='Markdown', disable_web_page_preview=True)
+
+
     async def handle_book_upload(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """处理用户上传的 EPUB/PDF 电子书，即时增量建库"""
         user_id = update.effective_user.id
@@ -864,7 +898,7 @@ class TelegramBotUI:
                     await update.message.reply_text(f"❌ 未能找到 [{keyword}] 第 {page} 页的公告。")
             return
             
-        text_lines = [f"🏢 **[{keyword}] 最新公告** (第 {page} 页)\\n"]
+        text_lines = [f"🏢 **[{keyword}] 最新公告** (第 {page} 页)\n"]
         keyboard = []
         num_row = []
         
@@ -899,16 +933,16 @@ class TelegramBotUI:
         if nav_row:
             keyboard.append(nav_row)
             
-        text_lines.append("\\n👉 _点击下方编号，AI 将为您极速解码这份研报的潜台词：_")
+        text_lines.append("\n👉 _点击下方编号，AI 将为您极速解码这份研报的潜台词：_")
         reply_markup = __import__('telegram').InlineKeyboardMarkup(keyboard)
         
         if message_to_edit:
-            await message_to_edit.edit_text("\\n".join(text_lines), reply_markup=reply_markup, parse_mode='Markdown')
+            await message_to_edit.edit_text("\n".join(text_lines), reply_markup=reply_markup, parse_mode='Markdown')
         else:
             if update.callback_query:
-                await update.callback_query.message.edit_text("\\n".join(text_lines), reply_markup=reply_markup, parse_mode='Markdown')
+                await update.callback_query.message.edit_text("\n".join(text_lines), reply_markup=reply_markup, parse_mode='Markdown')
             else:
-                await update.message.reply_text("\\n".join(text_lines), reply_markup=reply_markup, parse_mode='Markdown')
+                await update.message.reply_text("\n".join(text_lines), reply_markup=reply_markup, parse_mode='Markdown')
 
     async def _error_handler(self, update: object, context: ContextTypes.DEFAULT_TYPE):
         error_msg = str(context.error)
