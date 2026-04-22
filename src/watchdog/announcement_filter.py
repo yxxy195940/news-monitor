@@ -42,7 +42,7 @@ class AnnouncementDecoder:
             result_text = ""
             if self.llm_engine.provider == "deepseek":
                 response = self.llm_engine.deepseek_client.chat.completions.create(
-                    model="deepseek-chat",
+                    model="deepseek-reasoner",
                     messages=[{"role": "user", "content": prompt}],
                 )
                 result_text = response.choices[0].message.content
