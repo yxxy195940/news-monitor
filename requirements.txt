@@ -8,6 +8,7 @@ openai>=1.0.0
 PyMuPDF>=1.23.0
 EbookLib>=0.18
 beautifulsoup4>=4.12.0
+pdfplumber>=0.11.0
 langchain-text-splitters>=0.0.1
 
 # ===== 可选依赖（仅本地开发 / 高配服务器需要）=====
