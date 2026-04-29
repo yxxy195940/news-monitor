@@ -418,40 +418,7 @@ class TelegramBotUI:
                 # 仅清理这一个超标的关键字新闻池
                 self.news_filter.clear_matched_by_watch(watch_name)
 
-    async def background_poll_announcements(self, context: ContextTypes.DEFAULT_TYPE):
-        """后台轮询股票公告（每5分钟）"""
-        if not self.subscribers:
-            return
-            
-        watches = self.announcement_filter.get_all_watches()
-        if not watches:
-            return
-            
-        print("[哨兵进程] 正在轮询 A股公司公告...")
-        for code, info in watches.items():
-            name = info['name']
-            anns = self.announcement_api.fetch_latest_announcements(code, limit=3)
-            for ann in anns:
-                ann['watch_name'] = name
-                processed = self.announcement_filter.process_new_announcement(ann)
-                if processed:
-                    # 发现新公告并解析成功，直接向用户推送
-                    for chat_id in self.subscribers:
-                        try:
-                            msg = (
-                                f"🏢 **公司公告速递** | **{name}** (`{code}`)\n"
-                                f"━━━━━━━━━━━━━━━━\n"
-                                f"📑 **标题**：{processed['title']}\n"
-                                f"🕒 **时间**：{processed['time']}\n"
-                                f"📊 **AI 情感判断**：{processed['sentiment']}\n\n"
-                                f"🧠 **核心解读**：\n{processed['ai_summary']}\n\n"
-                            )
-                            if processed.get("url"):
-                                msg += f"🔗 [查看原公告PDF]({processed['url']})"
-                            
-                            await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode='Markdown')
-                        except Exception as e:
-                            print(f"[Telegram UI] 公告推送失败: {e}")
+
 
     async def _dispatch_news_ui(self, context: ContextTypes.DEFAULT_TYPE, chat_id: int, processed_news: ProcessedNews, raw_news: dict):
         self.user_context[chat_id] = processed_news

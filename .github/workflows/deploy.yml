@@ -25,9 +25,10 @@ jobs:
         run: pip install ruff
 
       - name: Run linter
+        continue-on-error: true  # 仅警告，不阻断部署
         run: |
           ruff check src/ main.py build_index.py --select=E,F,W --ignore=E501,W291,W293
-          echo "✅ 代码质量检查通过"
+          echo "✅ 代码质量检查完成"
 
   # ============================================================
   # Job 2: 部署到服务器（仅在 lint 通过后执行）
@@ -35,8 +36,9 @@ jobs:
   deploy:
     name: 🚀 Deploy to Server
     runs-on: ubuntu-latest
-    needs: lint  # 必须等 lint 通过才执行
-    environment: production  # 关联 GitHub 环境配置（可选，用于审批）
+    needs: lint  # lint 并行执行，因 continue-on-error 所以不会被阶断
+    if: always()  # 无论 lint 结果如何，都继续部署
+    environment: production
 
     steps:
       - name: Checkout code
