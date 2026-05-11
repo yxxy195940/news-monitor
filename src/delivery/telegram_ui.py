@@ -18,6 +18,8 @@ from src.watchdog.news_filter import NewsFilter
 from src.watchdog.digest_builder import DigestBuilder
 from src.ingestion.announcement_api import AnnouncementAPI
 from src.watchdog.announcement_filter import AnnouncementMonitor
+from src.ingestion.policy_fetcher import PolicyFetcher
+from src.watchdog.policy_filter import PolicyFilter
 
 class TelegramBotUI:
     def __init__(self):
@@ -50,6 +52,10 @@ class TelegramBotUI:
         self.announcement_decoder = self.announcement_monitor
         self.announcement_cache = {}
 
+        # ===== 宏观政策监控引擎 =====
+        self.policy_fetcher = PolicyFetcher()
+        self.policy_filter = PolicyFilter(self.llm_engine)
+
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
         self.subscribers.add(user_id)
@@ -74,6 +80,10 @@ class TelegramBotUI:
             "`/stocklist` - 查看当前公告监控列表\n"
             "`/ann 比亚迪` - 临时按需查询（不在监控列表中的股票也可用）\n"
             "`/anndigest` - 查看所有监控公司的已分析公告（按公司分组推送）\n\n"
+            "📊 **宏观政策监控（政策市一手情报）：**\n"
+            "`/policy` - 查看最新政策消息（20条）\n"
+            "`/policy 新能源` - 按行业板块过滤查看\n"
+            "可选板块：新能源/房地产/銀行金融/科技半导体/消费/医药医疗/军工国防/资本市场\n\n"
             "💬 **随时提问：**\n"
             "`/flash_off` - 关闭每30秒一次的高频快讯自动推送\n"
             "`/flash_on` - 重新开启快讯自动推送\n"
@@ -1030,7 +1040,107 @@ class TelegramBotUI:
         except Exception as e:
             print(f"[公告轮询] ❌ 轮询异常: {e}")
 
+
+    # ──────────────────────────────────────────────────────────────────
+    # 宏观政策监控 — 指令与后台任务
+    # ──────────────────────────────────────────────────────────────────
+    async def cmd_policy(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """/policy [板块] — 查看最新政策消息，可按行业板块筛选"""
+        sector = " ".join(context.args).strip() if context.args else None
+        records = self.policy_filter.get_latest(sector=sector, limit=20)
+
+        if not records:
+            tip = f"「{sector}」板块" if sector else "所有板块"
+            await update.message.reply_text(
+                f"📭 暂无{tip}的政策消息缓存。\n"
+                f"后台每 30 分钟自动抓取，可用 `/policy` 后跟板块名过滤：\n"
+                f"{' / '.join(self.policy_filter.get_all_sectors())}",
+                parse_mode='Markdown'
+            )
+            return
+
+        sector_label = f"「{sector}」" if sector else "全部板块"
+        lines = [f"📊 **A股政策情报** | {sector_label} | 最新 {len(records)} 条\n"]
+
+        for rec in records:
+            sentiment = rec.get("sentiment", "⚪ 中性")
+            sectors_str = "、".join(rec.get("sectors", [])) or "宏观"
+            pub = rec.get("pub_time", "")[:10]
+            title = rec.get("title", "")
+            summary = rec.get("summary", "")
+            url = rec.get("url", "")
+            source = rec.get("source", "")
+
+            line = f"{sentiment} [{sectors_str}] {pub}\n📰 {title}"
+            if summary:
+                line += f"\n💡 {summary}"
+            if url:
+                line += f"\n🔗 [{source}]({url})"
+            lines.append(line)
+            lines.append("─" * 14)
+
+        msg_text = "\n".join(lines)
+        # 超 4000 字符时分批发送
+        if len(msg_text) > 4000:
+            chunks = []
+            current = ""
+            for line in lines:
+                if len(current) + len(line) + 1 > 3800:
+                    chunks.append(current)
+                    current = line
+                else:
+                    current += "\n" + line
+            if current:
+                chunks.append(current)
+            for chunk in chunks:
+                await update.message.reply_text(chunk, parse_mode='Markdown', disable_web_page_preview=True)
+        else:
+            await update.message.reply_text(msg_text, parse_mode='Markdown', disable_web_page_preview=True)
+
+    async def background_poll_policy(self, context: ContextTypes.DEFAULT_TYPE):
+        """定时任务：每 30 分钟抓取政策新闻，LLM 分析，重大政策立即推送"""
+        print("[政策轮询] 开始采集宏观政策新闻...")
+        try:
+            raw = self.policy_fetcher.fetch_all(limit_per_source=20)
+            new_records = self.policy_filter.process_batch(raw)
+
+            # 重大政策立即推送给所有订阅者
+            major_records = [r for r in new_records if r.get("is_major")]
+            if major_records and self.subscribers:
+                for rec in major_records:
+                    sentiment = rec.get("sentiment", "⚪ 中性")
+                    sectors_str = "、".join(rec.get("sectors", [])) or "宏观"
+                    summary = rec.get("summary", "")
+                    url = rec.get("url", "")
+                    source = rec.get("source", "")
+
+                    msg = (
+                        f"🚨 **重大政策警报！**\n"
+                        f"{sentiment} [{sectors_str}]\n\n"
+                        f"📰 {rec['title']}\n"
+                    )
+                    if summary:
+                        msg += f"💡 {summary}\n"
+                    if url:
+                        msg += f"🔗 [{source}]({url})"
+
+                    for chat_id in self.subscribers:
+                        try:
+                            await context.bot.send_message(
+                                chat_id=chat_id,
+                                text=msg,
+                                parse_mode='Markdown',
+                                disable_web_page_preview=True
+                            )
+                        except Exception as e:
+                            print(f"[政策轮询] 推送失败 chat_id={chat_id}: {e}")
+
+            print(f"[政策轮询] ✅ 本轮新增 {len(new_records)} 条，其中重大 {len(major_records)} 条已推送。")
+        except Exception as e:
+            print(f"[政策轮询] ❌ 轮询异常: {e}")
+
     async def _error_handler(self, update: object, context: ContextTypes.DEFAULT_TYPE):
+
 
         error_msg = str(context.error)
         if "NetworkError" in error_msg or "ReadError" in error_msg or "ConnectError" in error_msg:
@@ -1066,6 +1176,8 @@ class TelegramBotUI:
         app.add_handler(CommandHandler("unwatchstock", self.cmd_unwatchstock))
         app.add_handler(CommandHandler("stocklist", self.cmd_stocklist))
         app.add_handler(CommandHandler("anndigest", self.cmd_anndigest))
+        # 政策监控命令
+        app.add_handler(CommandHandler("policy", self.cmd_policy))
         
         app.add_handler(CallbackQueryHandler(self.handle_button_click))
         # 书籍上传：优先于文字消息处理，必须放在 TEXT handler 之前
@@ -1078,7 +1190,8 @@ class TelegramBotUI:
         # 定时挂载区：宏观事件哨兵与高频快讯雷达
         app.job_queue.run_repeating(self.background_poll_news, interval=1800, first=60)
         app.job_queue.run_repeating(self.background_poll_flash, interval=30, first=80)
-        app.job_queue.run_repeating(self.background_poll_announcements, interval=600, first=120)  # 10分钟轮询公告
+        app.job_queue.run_repeating(self.background_poll_announcements, interval=600, first=120)
+        app.job_queue.run_repeating(self.background_poll_policy, interval=1800, first=300)  # 30分钟轮询政策新闻
         watchlist = self.announcement_monitor.get_watchlist()
         print("✅ 伴学智能体巨兽已苏醒！即刻前往 Telegram 对话。")
         print(f"📡 关键字监控已挂载，当前 {len(self.keyword_manager.get_all_watches())} 组监控活跃。")
